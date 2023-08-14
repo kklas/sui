@@ -33,6 +33,7 @@ const-str.workspace = true
 num-bigint.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 
 sui-config.workspace = true
 sui-execution = { path = "../../sui-execution" }
@@ -64,6 +65,8 @@ telemetry-subscribers.workspace = true
 
 move-core-types.workspace = true
 move-package.workspace = true
+move-binary-format.workspace = true
+move-symbol-pool.workspace = true
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 csv.workspace = true
 

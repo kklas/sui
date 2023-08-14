@@ -1,0 +1,11 @@
+[package]
+name = "bytecode_dependency"
+version = "0.0.1"
+
+[dependencies]
+Sui = { local = "../../../../sui-framework/packages/sui-framework" }
+AMM = { rpc = "https://fullnode.testnet.sui.io:443", address = "0xf917eb03d02b9221b10276064b2c10296276cb43feb24aac35113a272dd691c7" }
+
+[addresses]
+bytecode_dependency = "0x0"
+amm = "0xf917eb03d02b9221b10276064b2c10296276cb43feb24aac35113a272dd691c7"

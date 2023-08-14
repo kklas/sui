@@ -18,6 +18,7 @@ use std::{
 };
 use treeline::Tree;
 
+use crate::package_hooks::custom_resolve_pkg_name;
 use crate::{
     source_package::{
         layout::SourcePackageLayout,
@@ -110,6 +111,7 @@ impl ResolvedGraph {
             let mut resolved_pkg = Package::new(package_path, &build_options)
                 .with_context(|| format!("Resolving package '{pkg_name}'"))?;
 
+            /*
             if pkg_name != resolved_pkg.source_package.package.name {
                 bail!(
                     "Name of dependency '{}' does not match dependency's package name '{}'",
@@ -117,6 +119,7 @@ impl ResolvedGraph {
                     resolved_pkg.source_package.package.name
                 )
             }
+            */
 
             resolved_pkg
                 .define_addresses_in_package(&mut resolving_table)
@@ -328,7 +331,13 @@ impl Package {
     }
 
     fn define_addresses_in_package(&self, resolving_table: &mut ResolvingTable) -> Result<()> {
-        let package = self.source_package.package.name;
+        let package = custom_resolve_pkg_name(&self.package_path, &self.source_package)
+            .with_context(|| {
+                format!(
+                    "Resolving package name for '{}'",
+                    &self.source_package.package.name
+                )
+            })?;
         for (name, addr) in self.source_package.addresses.iter().flatten() {
             resolving_table.define((package, *name), *addr)?;
         }
@@ -342,7 +351,13 @@ impl Package {
         package_table: &PackageTable,
         resolving_table: &mut ResolvingTable,
     ) -> Result<()> {
-        let pkg_name = self.source_package.package.name;
+        let pkg_name = custom_resolve_pkg_name(&self.package_path, &self.source_package)
+            .with_context(|| {
+                format!(
+                    "Resolving package name for '{}'",
+                    &self.source_package.package.name
+                )
+            })?;
         let mut dep_renaming = BTreeMap::new();
 
         for (to, subst) in dep.subst.iter().flatten() {
@@ -409,7 +424,13 @@ impl Package {
     fn finalize_address_resolution(&mut self, resolving_table: &ResolvingTable) -> Result<()> {
         let mut unresolved_addresses = Vec::new();
 
-        let pkg_name = self.source_package.package.name;
+        let pkg_name = custom_resolve_pkg_name(&self.package_path, &self.source_package)
+            .with_context(|| {
+                format!(
+                    "Resolving package name for '{}'",
+                    &self.source_package.package.name
+                )
+            })?;
         for (name, addr) in resolving_table.bindings(pkg_name) {
             match *addr {
                 Some(addr) => {

@@ -7,11 +7,22 @@ use crate::fire_drill::{run_fire_drill, FireDrill};
 use crate::genesis_ceremony::{run, Ceremony};
 use crate::keytool::KeyToolCommand;
 use crate::validator_commands::SuiValidatorCommand;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use clap::*;
 use fastcrypto::traits::KeyPair;
+use move_binary_format::access::ModuleAccess;
+use move_binary_format::CompiledModule;
+use move_core_types::account_address::AccountAddress;
+use move_package::package_hooks::PackageHooks;
+use move_package::resolution::local_path;
+use move_package::source_package::layout::SourcePackageLayout;
+use move_package::source_package::parsed_manifest::{
+    CustomDepInfo, DependencyKind, SourceManifest,
+};
 use move_package::BuildConfig;
+use move_symbol_pool::Symbol;
 use rand::rngs::OsRng;
+use std::fmt::Write as _;
 use std::io::{stderr, stdout, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -25,16 +36,19 @@ use sui_config::{
 use sui_config::{
     SUI_BENCHMARK_GENESIS_GAS_KEYSTORE_FILENAME, SUI_GENESIS_FILENAME, SUI_KEYSTORE_FILENAME,
 };
+use sui_json_rpc_types::{SuiObjectDataOptions, SuiRawData, SuiRawMovePackage};
 use sui_keys::keystore::{AccountKeystore, FileBasedKeystore, Keystore};
 use sui_move::{self, execute_move_command};
-use sui_move_build::SuiPackageHooks;
+use sui_move_build::PUBLISHED_AT_MANIFEST_FIELD;
 use sui_sdk::sui_client_config::{SuiClientConfig, SuiEnv};
 use sui_sdk::wallet_context::WalletContext;
+use sui_sdk::SuiClientBuilder;
 use sui_swarm::memory::Swarm;
 use sui_swarm_config::genesis_config::{GenesisConfig, DEFAULT_NUMBER_OF_AUTHORITIES};
 use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_swarm_config::node_config_builder::FullnodeConfigBuilder;
+use sui_types::base_types::ObjectID;
 use sui_types::crypto::{SignatureScheme, SuiKeyPair};
 use tracing::info;
 
@@ -155,6 +169,149 @@ pub enum SuiCommand {
         #[clap(subcommand)]
         fire_drill: FireDrill,
     },
+}
+
+pub struct SuiPackageHooks;
+
+impl SuiPackageHooks {
+    async fn pkg_for_address(
+        &self,
+        rpc_url: &str,
+        addr: AccountAddress,
+    ) -> anyhow::Result<SuiRawMovePackage> {
+        let client = SuiClientBuilder::default().build(rpc_url).await?;
+        let read = client.read_api();
+
+        // Move packages are specified with an AccountAddress, but are
+        // fetched from a sui network via sui_getObject, which takes an object ID
+        let obj_id = ObjectID::from(addr);
+
+        // fetch the Sui object at the specified address
+        let obj_read = read
+            .get_object_with_options(obj_id, SuiObjectDataOptions::new().with_bcs())
+            .await
+            .with_context(|| format!("Could not read package on-chain object: {}", obj_id))?;
+
+        let obj = obj_read
+            .into_object()
+            .with_context(|| format!("Package bject does not exist or was deleted: {}", obj_id))?
+            .bcs
+            .with_context(|| "Bcs field is not found")?;
+
+        match obj {
+            SuiRawData::Package(pkg) => Ok(pkg),
+            SuiRawData::MoveObject(_) => {
+                bail!(
+                    "Package ID contains a Sui object, not a Move package: {}",
+                    obj_id
+                )
+            }
+        }
+    }
+
+    async fn resolve_original_id(
+        &self,
+        rpc_url: &str,
+        addr: AccountAddress,
+    ) -> anyhow::Result<AccountAddress> {
+        let pkg = self.pkg_for_address(rpc_url, addr).await?;
+        let module =
+            CompiledModule::deserialize_with_defaults(pkg.module_map.first_key_value().unwrap().1)
+                .with_context(|| format!("Failed to resolve original-id for: {}", addr))?;
+        Ok(module.address().clone())
+    }
+}
+
+impl PackageHooks for SuiPackageHooks {
+    fn custom_package_info_fields(&self) -> Vec<String> {
+        vec![PUBLISHED_AT_MANIFEST_FIELD.to_string()]
+    }
+
+    fn custom_dependency_key(&self) -> Option<String> {
+        Some(String::from("rpc"))
+    }
+
+    fn resolve_custom_dependency(
+        &self,
+        dep_name: move_symbol_pool::Symbol,
+        info: &CustomDepInfo,
+    ) -> anyhow::Result<()> {
+        let pkg_path = local_path(&DependencyKind::Custom(info.clone()));
+        println!("{:#?}", info);
+        println!("{:#?}", pkg_path);
+
+        if pkg_path.exists() {
+            fs::remove_dir_all(&pkg_path)?;
+        }
+
+        let addr = AccountAddress::from_hex_literal(&info.package_address)?;
+        let pkg = futures::executor::block_on(self.pkg_for_address(&info.node_url.as_str(), addr))?;
+
+        // generate a manifest
+        fs::create_dir_all(&pkg_path)?;
+        fs::create_dir_all(&pkg_path.join(SourcePackageLayout::Sources.location_str()))?;
+        let mut manifest = format!(
+            "[package]\n\
+            name = \"{}\"\n\
+            version = \"5.0.0\"\n\
+            published-at = \"{}\"\n",
+            dep_name,
+            info.package_address.as_str()
+        );
+
+        if !pkg.linkage_table.is_empty() {
+            writeln!(manifest, "\n[dependencies]").unwrap()
+        }
+        for id in pkg.linkage_table.keys() {
+            let published_at = id.to_hex_literal();
+            writeln!(
+                manifest,
+                "{} = {{ rpc = \"{}\", address = \"{}\" }}",
+                published_at,
+                &info.node_url.as_str(),
+                published_at
+            )
+            .unwrap();
+        }
+
+        fs::write(pkg_path.join("Move.toml"), manifest)?;
+
+        // fetch the package and save modules into `build/<dep_name>/`
+        let modules_out = pkg_path
+            .join("build")
+            .join(dep_name.as_str())
+            .join("bytecode_modules");
+        fs::create_dir_all(&modules_out)?;
+
+        for (name, bytes) in pkg.module_map {
+            fs::write(modules_out.join(format!("{}.mv", name)), &bytes)?;
+        }
+
+        Ok(())
+    }
+
+    fn custom_resolve_pkg_name(
+        &self,
+        _: &PathBuf,
+        manifest: &SourceManifest,
+    ) -> anyhow::Result<Symbol> {
+        let published_at = manifest
+            .package
+            .custom_properties
+            .get(&Symbol::from("published-at"));
+        match published_at {
+            Some(published_at) => {
+                // TODO: use RPC from environment
+                let rpc_url = "https://fullnode.testnet.sui.io:443";
+                let original_id = futures::executor::block_on(self.resolve_original_id(
+                    rpc_url,
+                    AccountAddress::from_hex_literal(published_at.as_str())?,
+                ))?;
+                Ok(Symbol::from(original_id.to_hex_literal()))
+            }
+            None => Ok(manifest.package.name),
+        }
+    }
 }
 
 impl SuiCommand {

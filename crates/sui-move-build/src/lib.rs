@@ -38,6 +38,7 @@ use move_package::{
     },
     package_hooks::PackageHooks,
     resolution::resolution_graph::ResolvedGraph,
+    source_package::parsed_manifest::SourceManifest,
     BuildConfig as MoveBuildConfig,
 };
 use move_package::{
@@ -631,6 +632,14 @@ impl PackageHooks for SuiPackageHooks {
         _info: &CustomDepInfo,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn custom_resolve_pkg_name(
+        &self,
+        _path: &PathBuf,
+        manifest: &SourceManifest,
+    ) -> anyhow::Result<Symbol> {
+        Ok(manifest.package.name)
     }
 }
 

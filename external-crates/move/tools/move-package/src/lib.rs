@@ -176,6 +176,7 @@ impl BuildConfig {
             manifest_string,
             lock_string,
         )?;
+        println!("!!! Dependency graph: {:#?}", dependency_graph);
 
         if modified {
             let lock = dependency_graph.write_to_lock(install_dir)?;
